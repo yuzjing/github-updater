@@ -10,7 +10,7 @@
 
 ## 解决方案 (The Solution)
 
-为了解决这个问题，我开发了这个名为 `gh-actions-nft-syncer` 的 Go 程序。
+为了解决这个问题，我开发了这个 Go 程序。
 
 它作为一个后台服务，通过 `Cron` 定时任务周期性运行。程序会自动从 GitHub 的官方 API 获取最新的 Actions IP 地址列表，并将其与 `nftables` 的一个指定集合（Set）进行同步。
 
