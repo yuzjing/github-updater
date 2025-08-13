@@ -2,7 +2,7 @@
 
 ## 场景 (The Problem)
 
-我使用 [GitHub Actions](https://github.com/features/actions) 自动部署 [Hugo](https://gohugo.io/) 静态网站到我的个人 VPS。为了最大限度地保障服务器安全，我的 VPS 上配置了 `nftables` 防火墙，并采用了**白名单策略**，默认拒绝所有入站连接，只允许特定 IP 地址访问 SSH 端口。
+使用 [GitHub Actions](https://github.com/features/actions) 自动部署 [Hugo](https://gohugo.io/) 静态网站到服务器。为了最大限度地保障服务器安全，服务器通常配置 `nftables` 防火墙，并采用了**白名单策略**，默认拒绝所有入站连接，只允许特定 IP 地址访问 SSH 端口。
 
 然而，GitHub Actions 的 Runner（执行构建任务的虚拟机）IP 地址是**动态变化**的，并且分布在一个巨大的地址段中。这就导致了每次 Actions 在执行部署任务（通过 SSH 连接 VPS）时，因为其 IP 不在我的防火墙白名单内而被拦截，从而导致自动化部署流程失败。
 
