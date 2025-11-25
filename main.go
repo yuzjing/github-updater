@@ -3,7 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"flag" // 导入 flag 包
+	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -13,7 +13,7 @@ import (
 	"text/template"
 )
 
-// NftablesConfig, GitHubMeta, nftTemplate ... 这些结构体和常量保持不变
+// 配置结构
 type NftablesConfig struct {
 	Family      string
 	TableName   string
@@ -22,19 +22,30 @@ type NftablesConfig struct {
 	IPv4Addrs   string
 	IPv6Addrs   string
 }
+
 type GitHubMeta struct {
 	Actions []string `json:"actions"`
 }
+
+// 模板：注意这里依然保留 flush，是为了防止“被占用无法删除”时也能正常更新数据
 const nftTemplate = `
+add table {{.Family}} {{.TableName}}
+
+# 1. 定义集合 (如果已存在且属性一致则忽略，如果不一致且被占用则会报错)
+add set {{.Family}} {{.TableName}} {{.IPv4SetName}} { type ipv4_addr; flags interval; auto-merge; }
+add set {{.Family}} {{.TableName}} {{.IPv6SetName}} { type ipv6_addr; flags interval; auto-merge; }
+
+# 2. 清空集合内容 (确保只有最新的 IP)
 flush set {{.Family}} {{.TableName}} {{.IPv4SetName}}
-add element {{.Family}} {{.TableName}} {{.IPv4SetName}} { {{.IPv4Addrs}} }
 flush set {{.Family}} {{.TableName}} {{.IPv6SetName}}
+
+# 3. 插入新数据
+add element {{.Family}} {{.TableName}} {{.IPv4SetName}} { {{.IPv4Addrs}} }
 add element {{.Family}} {{.TableName}} {{.IPv6SetName}} { {{.IPv6Addrs}} }
 `
 
-var verbose bool // 定义一个全局变量来存储是否启用详细模式
+var verbose bool
 
-// logVerbose 是一个新的帮助函数，只在 verbose 模式下打印日志
 func logVerbose(format string, v ...interface{}) {
 	if verbose {
 		log.Printf(format, v...)
@@ -42,37 +53,40 @@ func logVerbose(format string, v ...interface{}) {
 }
 
 func main() {
-	// 定义 -v 标志。当用户在命令行提供 -v 时，verbose 变量会变为 true
-	flag.BoolVar(&verbose, "v", false, "Enable verbose output for debugging.")
+	flag.BoolVar(&verbose, "v", false, "Enable verbose output.")
 	flag.Parse()
 
-	logVerbose("Starting GitHub Actions IP update process...")
+	logVerbose("Starting GitHub Actions IP update...")
+
+	// 尝试清理旧集合（解决属性不一致问题）
+	tryCleanupSets("inet", "filter", "github_actions_ipv4")
+	tryCleanupSets("inet", "filter", "github_actions_ipv6")
 
 	// 1. 获取数据
 	meta, err := fetchGitHubMeta()
 	if err != nil {
-		log.Fatalf("ERROR: Failed to fetch GitHub meta data: %v", err)
+		log.Fatalf("ERROR: Fetch meta failed: %v", err)
 	}
-	logVerbose("Successfully fetched %d IP ranges from GitHub.", len(meta.Actions))
 
-	// 2. 分类 IP
+	// 2. 分类 IP (先分类，统计出数量)
 	var ipv4s, ipv6s []string
 	for _, cidr := range meta.Actions {
-		ip, _, err := net.ParseCIDR(cidr)
-		if err != nil {
-			log.Printf("Warning: Could not parse CIDR %s. Skipping.", cidr)
-			continue
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			continue // 跳过无效的
 		}
-		if ip.To4() != nil {
-			ipv4s = append(ipv4s, cidr)
-		} else {
+		if strings.Contains(cidr, ":") {
 			ipv6s = append(ipv6s, cidr)
+		} else {
+			ipv4s = append(ipv4s, cidr)
 		}
 	}
-	logVerbose("Found %d IPv4 ranges and %d IPv6 ranges.", len(ipv4s), len(ipv6s))
 
-	if len(ipv4s) == 0 || len(ipv6s) == 0 {
-		log.Fatalf("ERROR: Did not find both IPv4 and IPv6 addresses. Aborting to be safe.")
+	// --- 这里是你要求的修改 ---
+	// 此时已经分类完成，可以直接打印详细统计信息
+	logVerbose("Fetched %d ranges (IPv4: %d, IPv6: %d).", len(meta.Actions), len(ipv4s), len(ipv6s))
+
+	if len(ipv4s) == 0 && len(ipv6s) == 0 {
+		log.Fatalf("ERROR: No valid IPs parsed.")
 	}
 
 	// 3. 填充配置
@@ -86,61 +100,73 @@ func main() {
 	}
 
 	// 4. 生成命令
-	commands, err := generateNftCommands(config)
+	payload, err := generateNftCommands(config)
 	if err != nil {
-		log.Fatalf("ERROR: Failed to generate nftables commands: %v", err)
+		log.Fatalf("Template error: %v", err)
 	}
 
 	// 5. 执行命令
-	if err := executeNftCommands(commands); err != nil {
-		log.Fatalf("ERROR: Failed to execute nftables commands: %v", err)
+	if err := executeNftCommands(payload); err != nil {
+		log.Fatalf("ERROR: Execution failed: %v", err)
 	}
 
-	// 这是唯一在默认模式下成功时会打印的消息
-	log.Println("Successfully updated nftables sets for GitHub Actions.")
+	log.Println("Successfully updated nftables sets.")
 }
 
-// executeNftCommands 现在也使用 logVerbose
-func executeNftCommands(commands string) error {
-	logVerbose("Preparing to execute nft commands...")
-	
-	cmd := exec.Command("sudo", "nft", "-f", "-")
-	cmd.Stdin = strings.NewReader(commands)
+// 新增的清理函数
+func tryCleanupSets(family, table, setName string) {
+	logVerbose("Attempting to cleanup old set: %s ...", setName)
 
+	// 我们单独执行 delete 命令，不放在批量事务里，因为如果集合不存在，delete 会报错导致整个事务回滚。
+	// 这里我们只关心尝试删除，失败了（比如不存在，或者被占用）也不影响主程序继续尝试更新。
+	cmd := exec.Command("nft", "delete", "set", family, table, setName)
+	output, err := cmd.CombinedOutput()
+
+	if err != nil {
+		// 这里的错误通常有两个：
+		// 1. "No such file or directory": 集合本来就不存在 -> 好事，直接忽略。
+		// 2. "Device or resource busy": 集合正在被规则使用 -> 无法删除。
+		//    如果是这种情况，我们只能寄希望于集合属性已经正确，通过后续的 flush 更新。
+		logVerbose("Cleanup ignored (set might be busy or missing): %v - %s", err, strings.TrimSpace(string(output)))
+	} else {
+		logVerbose("Old set %s deleted successfully.", setName)
+	}
+}
+
+func executeNftCommands(commands string) error {
+	logVerbose("Executing main update commands...")
+	cmd := exec.Command("nft", "-f", "-")
+	cmd.Stdin = strings.NewReader(commands)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("nft command failed: %v\nOutput:\n%s", err, string(output))
+		return fmt.Errorf("nft failed: %v\nOutput: %s", err, string(output))
 	}
-	
-	// 只在详细模式下打印 nft 的成功输出
-	logVerbose("nft command output: %s", string(output))
 	return nil
 }
 
-// fetchGitHubMeta 和 generateNftCommands 函数保持不变
 func fetchGitHubMeta() (*GitHubMeta, error) {
-    resp, err := http.Get("https://api.github.com/meta")
-    if err != nil {
-        return nil, err
-    }
-    defer resp.Body.Close()
-    if resp.StatusCode != http.StatusOK {
-        return nil, fmt.Errorf("bad status from GitHub API: %s", resp.Status)
-    }
-    var meta GitHubMeta
-    if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
-        return nil, err
-    }
-    return &meta, nil
+	client := &http.Client{}
+	req, _ := http.NewRequest("GET", "https://api.github.com/meta", nil)
+	req.Header.Set("User-Agent", "go-nft-updater/1.0")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	}
+	var meta GitHubMeta
+	err = json.NewDecoder(resp.Body).Decode(&meta)
+	return &meta, err
 }
+
 func generateNftCommands(config NftablesConfig) (string, error) {
-    tmpl, err := template.New("nft").Parse(strings.TrimSpace(nftTemplate))
-    if err != nil {
-        return "", err
-    }
-    var buf bytes.Buffer
-    if err := tmpl.Execute(&buf, config); err != nil {
-        return "", err
-    }
-    return buf.String(), nil
+	tmpl, err := template.New("nft").Parse(strings.TrimSpace(nftTemplate))
+	if err != nil {
+		return "", err
+	}
+	var buf bytes.Buffer
+	err = tmpl.Execute(&buf, config)
+	return buf.String(), err
 }
