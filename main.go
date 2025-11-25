@@ -27,7 +27,7 @@ type GitHubMeta struct {
 	Actions []string `json:"actions"`
 }
 
-// 模板：注意这里依然保留 flush，是为了防止“被占用无法删除”时也能正常更新数据
+// 防止“被占用无法删除”时也能正常更新数据
 const nftTemplate = `
 add table {{.Family}} {{.TableName}}
 
@@ -81,8 +81,6 @@ func main() {
 		}
 	}
 
-	// --- 这里是你要求的修改 ---
-	// 此时已经分类完成，可以直接打印详细统计信息
 	logVerbose("Fetched %d ranges (IPv4: %d, IPv6: %d).", len(meta.Actions), len(ipv4s), len(ipv6s))
 
 	if len(ipv4s) == 0 && len(ipv6s) == 0 {
@@ -117,16 +115,15 @@ func main() {
 func tryCleanupSets(family, table, setName string) {
 	logVerbose("Attempting to cleanup old set: %s ...", setName)
 
-	// 我们单独执行 delete 命令，不放在批量事务里，因为如果集合不存在，delete 会报错导致整个事务回滚。
-	// 这里我们只关心尝试删除，失败了（比如不存在，或者被占用）也不影响主程序继续尝试更新。
+	// 独执行 delete 命令，不放在批量事务里，因为如果集合不存在，delete 会报错导致整个事务回滚。
+	// 只关心尝试删除，失败了（比如不存在，或者被占用）也不影响主程序继续尝试更新。
 	cmd := exec.Command("nft", "delete", "set", family, table, setName)
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
 		// 这里的错误通常有两个：
 		// 1. "No such file or directory": 集合本来就不存在 -> 好事，直接忽略。
-		// 2. "Device or resource busy": 集合正在被规则使用 -> 无法删除。
-		//    如果是这种情况，我们只能寄希望于集合属性已经正确，通过后续的 flush 更新。
+		// 2. "Device or resource busy": 集合正在被规则使用 -> 无法删除。如果是这种情况，寄希望于集合属性已经正确，通过后续的 flush 更新。
 		logVerbose("Cleanup ignored (set might be busy or missing): %v - %s", err, strings.TrimSpace(string(output)))
 	} else {
 		logVerbose("Old set %s deleted successfully.", setName)
